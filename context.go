@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"slices"
 	"sort"
@@ -3413,7 +3414,10 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 		}
 
 		pprof.Do(c.Context, pprof.Labels("blueprint", "GC"), func(ctx context.Context) {
-			runtime.GC()
+			// Module build actions create a large amount of short-lived cloning
+			// garbage.  Return its pages before singleton generation starts so it
+			// cannot overlap with the singleton working set.
+			debug.FreeOSMemory()
 		})
 
 		var depsSingletons []string
@@ -3446,6 +3450,11 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 		c.globalVariables = c.liveGlobals.variables
 		c.globalPools = c.liveGlobals.pools
 		c.globalRules = c.liveGlobals.rules
+
+		// All build actions and singleton actions are now materialized.  The
+		// following stage only serializes them, so release pages made obsolete by
+		// analysis before starting Ninja generation.
+		debug.FreeOSMemory()
 
 		c.buildActionsReady = true
 	})
@@ -5263,6 +5272,13 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
 			return
 		}
 
+		// Singletons have already generated their actions by this point.  Ninja
+		// serialization only needs module metadata and actionDefs, not the cloned
+		// Module objects and their properties.  Keeping those clones alive was a
+		// major peak-RSS contributor for Kati-enabled Soong builds.
+		c.releaseModulesAfterBuildActions()
+		debug.FreeOSMemory()
+
 		nw := newNinjaWriter(w)
 
 		if err = c.writeBuildFileHeader(nw); err != nil {
@@ -5298,6 +5314,9 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
 		if err = c.writeAllModuleActions(nw, shardNinja, ninjaFileName); err != nil {
 			return
 		}
+
+		// Return temporary serialization buffers before writing singleton actions.
+		debug.FreeOSMemory()
 
 		if err = c.writeAllSingletonActions(nw); err != nil {
 			return
@@ -5583,6 +5602,12 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 
 	phonys := c.deduplicateOrderOnlyDeps(modules)
 
+	// After deduplication every buildDef has been rewritten to use its compact
+	// phony dependency.  The SyncMap still holds the original, often large,
+	// order-only string lists and is no longer needed for Ninja serialization.
+	c.orderOnlyStrings = syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]{}
+	debug.FreeOSMemory()
+
 	c.EventHandler.Do("sort_phony_builddefs", func() {
 		// sorting for determinism, the phony output names are stable
 		sort.Slice(phonys.buildDefs, func(i int, j int) bool {
@@ -5784,6 +5809,24 @@ func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter) erro
 		}
 	}
 	return nil
+}
+
+// releaseModulesAfterBuildActions drops the cloned Module instances after all
+// module and singleton GenerateBuildActions calls have completed.  Later
+// stages access only moduleInfo metadata, providers, and localBuildActions.
+func (c *Context) releaseModulesAfterBuildActions() {
+	for module := range c.iterateAllVariants() {
+		if module.logicModule == nil {
+			continue
+		}
+
+		// Keep the values ModuleProxy exposes after a module has been released.
+		module.cachedName = module.logicModule.Name()
+		module.cachedString = module.logicModule.String()
+		module.logicModule = nil
+		module.properties = nil
+		module.propertyPos = nil
+	}
 }
 
 func (c *Context) writeOneModuleAction(module *moduleInfo, nw *ninjaWriter, buf *bytes.Buffer) error {
